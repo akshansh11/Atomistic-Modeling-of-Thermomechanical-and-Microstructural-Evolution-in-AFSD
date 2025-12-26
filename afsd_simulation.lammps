@@ -1,0 +1,253 @@
+# AFSD Simulation - ENHANCED HIGH RESOLUTION
+# FINAL WORKING VERSION - All issues resolved
+
+# ===== INITIALIZATION =====
+units metal
+dimension 3
+boundary p p f
+atom_style atomic
+atom_modify map array
+
+# ===== ATOM DEFINITION =====
+lattice fcc 4.05
+region box block -50 50 -50 50 0 120 units box
+create_box 3 box
+
+# Substrate
+region substrate block -50 50 -50 50 0 25 units box
+create_atoms 1 region substrate
+
+# Feedstock
+region feedstock cylinder z 0 0 7.0 27 110 units box
+create_atoms 2 region feedstock
+
+# ===== FORCE FIELD =====
+pair_style eam/alloy
+pair_coeff * * Al99.eam.alloy Al Al Al
+mass * 26.98
+
+# ===== GROUPS =====
+group substrate type 1
+group feedstock type 2
+group deposited type 3
+
+# Region definitions
+variable r atom sqrt(x*x+y*y)
+
+# Oxide layer
+variable oxide_flag atom "v_r>6.0&&v_r<7.0&&type==2"
+group oxide_layer dynamic all var oxide_flag every 100
+
+# Core tracers
+variable core_flag atom "v_r<1.5&&type==2"
+group core_tracers dynamic all var core_flag every 100
+
+# Interface
+variable interface_flag atom "z>20&&z<30"
+group interface dynamic all var interface_flag every 500
+
+# Bottom boundary - FIXED LAYER
+region bottom_fix block INF INF INF INF 0 3 units box
+group bottom_atoms region bottom_fix
+
+# Mobile substrate (everything except bottom)
+group mobile_substrate subtract substrate bottom_atoms
+
+# Top boundary
+region top_cool block INF INF INF INF 100 120 units box
+group top_atoms region top_cool
+
+# ===== INITIAL CONDITIONS =====
+velocity all create 300.0 482947
+velocity bottom_atoms set 0.0 0.0 0.0
+
+# ===== SETTINGS =====
+neighbor 2.0 bin
+neigh_modify every 1 delay 5 check yes
+timestep 0.001
+
+# ===== COMPUTES =====
+compute temp_sub mobile_substrate temp
+compute temp_feed feedstock temp
+compute pe_atom all pe/atom
+compute ke_atom all ke/atom
+compute stress_atom all stress/atom NULL
+compute centro all centro/atom fcc
+compute cna all cna/atom 3.5
+compute coord all coord/atom cutoff 3.2
+compute displace all displace/atom
+compute voronoi all voronoi/atom
+
+# Temperature field
+compute temp_spatial all chunk/atom bin/3d x lower 5.0 y lower 5.0 z lower 5.0
+compute temp_profile all temp/chunk temp_spatial temp
+
+# ===== THERMO OUTPUT =====
+thermo 500
+thermo_style custom step dt temp pe ke etotal press vol c_temp_sub c_temp_feed atoms
+
+# ===== FIXES =====
+# Bottom layer completely frozen
+fix 1 bottom_atoms setforce 0.0 0.0 0.0
+
+# Temperature control for mobile parts
+fix nvt_sub mobile_substrate nvt temp 300 500 0.1
+fix nvt_feed feedstock nvt temp 300 800 0.1
+
+# Rotation (300 rpm)
+variable omega equal 31.4
+variable rot_vx atom "-v_omega*y"
+variable rot_vy atom "v_omega*x"
+fix rotation feedstock addforce v_rot_vx v_rot_vy 0.0
+
+# Translation
+variable v_traverse equal 0.00212
+fix traverse feedstock move linear ${v_traverse} 0.0 0.0
+
+# Feed
+variable v_feed equal -0.00212
+fix feed feedstock move linear 0.0 0.0 ${v_feed}
+
+# Heat dissipation at top
+fix cool_top top_atoms langevin 300 300 0.05 928374
+
+# ===== OUTPUT =====
+dump 1 all custom 1000 dump.afsd.* id type x y z vx vy vz &
+     c_pe_atom c_ke_atom c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+     c_centro c_coord c_voronoi[1]
+dump_modify 1 sort id
+
+dump 2 oxide_layer custom 500 oxide.lammpstrj.* id type x y z c_pe_atom c_coord
+dump 3 core_tracers custom 500 tracers.lammpstrj.* id type x y z vx vy vz
+dump 4 interface custom 1000 interface.lammpstrj.* id type x y z c_coord c_centro
+
+# Time-averaged outputs
+fix temp_ave all ave/chunk 1000 10 10000 temp_spatial temp file temp_profile.dat
+
+compute avg_coord all reduce ave c_coord
+fix coord_track all ave/time 100 1 100 c_avg_coord file coordination.dat
+
+compute stress_xx all reduce ave c_stress_atom[1]
+compute stress_yy all reduce ave c_stress_atom[2]
+compute stress_zz all reduce ave c_stress_atom[3]
+fix stress_track all ave/time 100 1 100 c_stress_xx c_stress_yy c_stress_zz file stress.dat
+
+variable total_pe equal pe
+variable total_ke equal ke
+fix energy_track all ave/time 10 1 10 v_total_pe v_total_ke file energy.dat
+
+compute avg_displace all reduce ave c_displace[4]
+fix displace_track all ave/time 100 1 100 c_avg_displace file displacement.dat
+
+# ===== RESTART =====
+restart 10000 restart.afsd.a restart.afsd.b
+
+# FLAG to track if friction heating fix was created
+variable has_friction_heat equal 0
+
+# ===== STAGE 1: EQUILIBRATION =====
+print "===== Stage 1: Equilibration ====="
+run 5000
+
+# ===== STAGE 2: TOOL ENGAGEMENT =====
+print "===== Stage 2: Tool Engagement ====="
+unfix nvt_feed
+fix nvt_feed_hot feedstock nvt temp 800 1000 0.1
+
+# Run to let feedstock move down
+run 5000
+
+# Add frictional heating
+variable heat_rate equal 1.0e-4
+region contact_zone cylinder z 0 0 10.0 15 40 units box
+group contact_atoms dynamic all region contact_zone every 100
+
+variable n_contact equal count(contact_atoms)
+print "Contact atoms: ${n_contact}"
+
+if "${n_contact} > 0" then &
+  "fix friction_heat contact_atoms heat 1 ${heat_rate}" &
+  "variable has_friction_heat equal 1" &
+else &
+  "print 'WARNING: No contact atoms found, skipping friction heating'"
+
+run 5000
+
+# ===== STAGE 3: ACTIVE DEPOSITION =====
+print "===== Stage 3: Active Deposition ====="
+
+# Define deposition threshold and region ONCE
+variable deposit_threshold equal 28.0
+
+# Use dynamic group with variable instead of recreating region
+variable deposit_flag atom "z<v_deposit_threshold&&type==2"
+group depositing_atoms dynamic all var deposit_flag every 200
+
+variable loop_count loop 30
+label loop_start
+
+run 5000
+
+# Convert depositing atoms to type 3
+set group depositing_atoms type 3
+
+# Update groups
+group feedstock type 2
+group deposited type 3
+
+variable n_deposited equal count(deposited)
+print "Deposited atoms: ${n_deposited}"
+
+next loop_count
+jump SELF loop_start
+label loop_end
+
+# ===== STAGE 4: STEADY STATE =====
+print "===== Stage 4: Steady State ====="
+variable loop_count2 loop 20
+label loop_start2
+
+run 5000
+
+# Convert depositing atoms
+set group depositing_atoms type 3
+group feedstock type 2
+group deposited type 3
+
+next loop_count2
+jump SELF loop_start2
+label loop_end2
+
+# ===== STAGE 5: COOLDOWN =====
+print "===== Stage 5: Cooldown ====="
+
+# Only unfix if the fix was actually created
+if "${has_friction_heat} == 1" then "unfix friction_heat"
+
+fix cooldown all langevin 1000 300 0.5 482947
+run 50000
+
+# ===== FINAL ANALYSIS =====
+print "===== Final Analysis ====="
+write_data final_state.data
+
+variable n_substrate equal count(substrate)
+variable n_feedstock equal count(feedstock)
+variable n_deposited equal count(deposited)
+variable final_temp equal temp
+
+print "Final Statistics:"
+print "Substrate atoms: ${n_substrate}"
+print "Feedstock atoms: ${n_feedstock}"
+print "Deposited atoms: ${n_deposited}"
+print "Final temperature: ${final_temp} K"
+
+compute final_coord_avg all reduce ave c_coord
+compute final_centro_avg all reduce ave c_centro
+variable coord_final equal c_final_coord_avg
+variable centro_final equal c_final_centro_avg
+
+print "Average coordination: ${coord_final}"
+print "Average centro-symmetry: ${centro_final}"
+
+print "===== AFSD Simulation Complete ====="
